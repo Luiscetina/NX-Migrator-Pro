@@ -13,11 +13,18 @@ import tempfile
 import struct
 import re
 import os
+import sys
 from pathlib import Path
 from typing import Callable, Optional
 from core.disk_manager import DiskManager
 from core.partition_writer import PartitionWriter
 from core.partition_models import DiskLayout
+
+# Windows-specific flag to prevent console window from appearing
+if sys.platform == 'win32':
+    CREATE_NO_WINDOW = 0x08000000
+else:
+    CREATE_NO_WINDOW = 0
 
 logger = logging.getLogger(__name__)
 
@@ -1094,7 +1101,7 @@ rescan
             logger.warning(f"Could not refresh disk partitions: {e}")
 
     def _copy_files_simple(self, source_drive, target_drive, stage_name, base_progress, progress_range=60):
-        """Copy files using simple Python shutil - more reliable than robocopy
+        """Copy files using Windows native PowerShell Copy-Item - same as Windows Explorer
 
         Args:
             progress_range: Total progress range allocated for file copy (default 60)
@@ -1102,138 +1109,289 @@ rescan
         import os
         from pathlib import Path
 
-        # Ensure drive letters are properly formatted (e.g., "G:\" or "G:/")
-        # Don't strip the colon - only strip trailing backslashes
-        source = Path(source_drive.rstrip('\\') + '\\')
-        target = Path(target_drive.rstrip('\\') + '\\')
+        # Ensure drive letters are properly formatted
+        source = source_drive.rstrip('\\')
+        target = target_drive.rstrip('\\')
 
-        logger.info(f"Starting file copy: {source} -> {target}")
-        logger.info(f"Checking if source exists and is accessible...")
+        logger.info(f"Starting Windows native file copy: {source} -> {target}")
+        logger.info(f"Using PowerShell Copy-Item (same as Windows Explorer)")
 
-        # Verify source path exists and is accessible
-        if not source.exists():
+        # Verify source path exists
+        if not Path(source).exists():
             raise Exception(f"Source path does not exist: {source}")
 
-        if not source.is_dir():
-            raise Exception(f"Source path is not a directory: {source}")
-
-        # Count total files first for better progress reporting
-        logger.info(f"Scanning source directory for files...")
-
-        # Define system folders/files to exclude (anything starting with dot)
-        def should_skip(name):
-            """Skip hidden files/folders (those starting with dot)"""
-            return name.startswith('.')
-
-        # Count files, excluding hidden/system files and folders
-        total_files = 0
-        for root, dirs, files in os.walk(source):
-            # Remove hidden directories from dirs list to prevent os.walk from entering them
-            dirs[:] = [d for d in dirs if not should_skip(d)]
-            # Count only non-hidden files
-            total_files += sum(1 for f in files if not should_skip(f))
-
-        logger.info(f"Found {total_files} files to copy (excluding hidden/system files)")
-
-        start_time = time.time()
-        files_copied = 0
-        bytes_copied = 0
-        skipped_files = 0
-        failed_files = []
+        # Count total size first for progress tracking
+        logger.info(f"Calculating total size...")
+        self._report_progress(stage_name, base_progress, "Calculating copy size...")
 
         try:
-            # Walk through source directory
-            for root, dirs, files in os.walk(source):
-                # Skip hidden directories (modify dirs in-place to prevent os.walk from entering them)
-                original_dirs = dirs[:]
-                dirs[:] = [d for d in dirs if not should_skip(d)]
-
-                # Log skipped directories
-                skipped_dirs = set(original_dirs) - set(dirs)
-                if skipped_dirs:
-                    for skipped_dir in skipped_dirs:
-                        logger.info(f"Skipping hidden/system directory: {Path(root) / skipped_dir}")
-
-                # Calculate relative path
-                rel_path = Path(root).relative_to(source)
-                target_dir = target / rel_path
-
-                # Create target directory if it doesn't exist
-                target_dir.mkdir(parents=True, exist_ok=True)
-
-                # Copy each file (skip hidden files)
-                for file in files:
-                    # Skip hidden/system files
-                    if should_skip(file):
-                        skipped_files += 1
-                        logger.debug(f"Skipping hidden/system file: {Path(root) / file}")
-                        continue
-                    if self.cancelled:
-                        raise Exception("Migration cancelled by user")
-
-                    source_file = Path(root) / file
-                    target_file = target_dir / file
-
-                    try:
-                        # Copy file
-                        shutil.copy2(source_file, target_file)
-                        files_copied += 1
-                        bytes_copied += source_file.stat().st_size
-
-                        # Update progress every 10 files or every 100MB
-                        if files_copied % 10 == 0 or (bytes_copied // (100 * 1024 * 1024)) > ((bytes_copied - source_file.stat().st_size) // (100 * 1024 * 1024)):
-                            elapsed = time.time() - start_time
-                            speed_mbps = (bytes_copied / (1024 * 1024)) / elapsed if elapsed > 0 else 0
-                            percent_complete = (files_copied / total_files * 100) if total_files > 0 else 0
-                            logger.info(f"Copied {files_copied}/{total_files} files ({percent_complete:.1f}%), {bytes_copied / (1024**3):.2f} GB at {speed_mbps:.1f} MB/s")
-
-                            # Calculate progress within allocated range
-                            # Use 90% of the range for actual copying, reserve 10% for completion
-                            file_progress = (files_copied / total_files * progress_range * 0.9) if total_files > 0 else 0
-                            current_progress = base_progress + file_progress
-                            # Cap at 100% to prevent overflow
-                            current_progress = min(100, current_progress)
-                            self._report_progress(stage_name, current_progress,
-                                                f"Copied {files_copied}/{total_files} files ({percent_complete:.0f}%)")
-                    except Exception as e:
-                        # Log error but continue with other files (non-fatal)
-                        logger.error(f"Failed to copy {source_file}: {e}")
-                        failed_files.append(str(source_file))
-                        # Continue to next file instead of raising
-
-            elapsed_time = time.time() - start_time
-            mb_copied = bytes_copied / (1024 * 1024)
-            speed_mbps = mb_copied / elapsed_time if elapsed_time > 0 else 0
-
-            logger.info(f"File copy completed in {elapsed_time:.1f} seconds")
-            logger.info(f"Files copied: {files_copied} of {total_files}")
-            logger.info(f"Data copied: {mb_copied:.1f} MB ({bytes_copied / (1024**3):.2f} GB) at {speed_mbps:.1f} MB/s")
-
-            # Report skipped hidden/system files
-            if skipped_files > 0:
-                logger.info(f"Skipped {skipped_files} hidden/system files (files starting with '.')")
-
-            # Report failed files
-            if failed_files:
-                logger.warning(f"Failed to copy {len(failed_files)} file(s):")
-                for failed_file in failed_files[:10]:  # Show first 10 failed files
-                    logger.warning(f"  - {failed_file}")
-                if len(failed_files) > 10:
-                    logger.warning(f"  ... and {len(failed_files) - 10} more")
-
-            if files_copied == 0:
-                logger.warning(f"No files were found in source directory: {source}")
-                logger.warning(f"The source FAT32 partition appears to be empty!")
-
-            # Final progress - cap at 100%
-            final_progress = min(100, base_progress + progress_range)
-            status_msg = f"✓ Copied {files_copied} files ({mb_copied:.0f} MB) in {elapsed_time:.0f}s"
-            if failed_files:
-                status_msg += f" ({len(failed_files)} failed)"
-            self._report_progress(stage_name, final_progress, status_msg)
+            # Use PowerShell to get total size (faster than Python os.walk)
+            size_cmd = f'''
+            $totalSize = (Get-ChildItem -Path "{source}" -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+            if ($totalSize -eq $null) {{ $totalSize = 0 }}
+            Write-Output $totalSize
+            '''
+            result = subprocess.run(
+                ['powershell', '-NoProfile', '-WindowStyle', 'Hidden', '-Command', size_cmd],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                creationflags=CREATE_NO_WINDOW
+            )
+            total_bytes = int(result.stdout.strip()) if result.returncode == 0 and result.stdout.strip() else 0
+            total_gb = total_bytes / (1024**3)
+            logger.info(f"Total size to copy: {total_gb:.2f} GB ({total_bytes:,} bytes)")
 
         except Exception as e:
-            logger.error(f"File copy error: {e}")
+            logger.warning(f"Could not calculate total size: {e}. Proceeding with copy...")
+            total_bytes = 0
+
+        start_time = time.time()
+
+        # PowerShell script for copying with progress tracking
+        # Using -Force to overwrite, -Recurse for subdirectories
+        # This mimics Windows Explorer's copy behavior
+        ps_script = f'''
+        $ErrorActionPreference = "Continue"
+        $source = "{source}\\*"
+        $destination = "{target}"
+
+        # Copy all items recursively (like Windows Explorer)
+        Copy-Item -Path $source -Destination $destination -Recurse -Force -ErrorAction Continue
+
+        if ($?) {{
+            Write-Output "SUCCESS"
+        }} else {{
+            Write-Output "COMPLETED_WITH_ERRORS"
+        }}
+        '''
+
+        logger.info(f"Executing Windows copy operation...")
+        self._report_progress(stage_name, base_progress + 5, "Copying files with Windows native method...")
+
+        try:
+            # Run PowerShell copy in background and monitor progress
+            process = subprocess.Popen(
+                ['powershell', '-NoProfile', '-WindowStyle', 'Hidden', '-Command', ps_script],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                creationflags=CREATE_NO_WINDOW
+            )
+
+            # Monitor progress by checking target directory size
+            last_check_time = time.time()
+            check_interval = 2.0  # Check every 2 seconds
+
+            while process.poll() is None:
+                if self.cancelled:
+                    process.kill()
+                    raise Exception("Migration cancelled by user")
+
+                current_time = time.time()
+                if current_time - last_check_time >= check_interval:
+                    try:
+                        # Check how much has been copied so far
+                        size_check_cmd = f'''
+                        $copiedSize = (Get-ChildItem -Path "{target}" -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+                        if ($copiedSize -eq $null) {{ $copiedSize = 0 }}
+                        Write-Output $copiedSize
+                        '''
+                        size_result = subprocess.run(
+                            ['powershell', '-NoProfile', '-WindowStyle', 'Hidden', '-Command', size_check_cmd],
+                            capture_output=True,
+                            text=True,
+                            timeout=5,
+                            creationflags=CREATE_NO_WINDOW
+                        )
+                        copied_bytes = int(size_result.stdout.strip()) if size_result.returncode == 0 and size_result.stdout.strip() else 0
+
+                        # Calculate progress
+                        elapsed = current_time - start_time
+                        speed_mbps = (copied_bytes / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+                        copied_gb = copied_bytes / (1024**3)
+
+                        if total_bytes > 0:
+                            percent = min(95, (copied_bytes / total_bytes * 100))  # Cap at 95% until confirmed done
+                            progress = base_progress + (percent / 100 * progress_range * 0.9)
+                            logger.info(f"Copying: {copied_gb:.2f} GB / {total_gb:.2f} GB ({percent:.1f}%) at {speed_mbps:.1f} MB/s")
+                            self._report_progress(stage_name, progress, f"Copied {copied_gb:.1f}/{total_gb:.1f} GB ({percent:.0f}%)")
+                        else:
+                            logger.info(f"Copying: {copied_gb:.2f} GB at {speed_mbps:.1f} MB/s")
+                            self._report_progress(stage_name, base_progress + 30, f"Copied {copied_gb:.1f} GB")
+
+                        last_check_time = current_time
+
+                    except Exception as e:
+                        logger.debug(f"Could not check copy progress: {e}")
+
+                time.sleep(0.5)
+
+            # Get final output
+            stdout, stderr = process.communicate()
+
+            elapsed_time = time.time() - start_time
+
+            # Check if copy was successful
+            if "SUCCESS" in stdout or "COMPLETED_WITH_ERRORS" in stdout:
+                # Get final copied size
+                try:
+                    size_check_cmd = f'''
+                    $copiedSize = (Get-ChildItem -Path "{target}" -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+                    if ($copiedSize -eq $null) {{ $copiedSize = 0 }}
+                    Write-Output $copiedSize
+                    '''
+                    size_result = subprocess.run(
+                        ['powershell', '-NoProfile', '-WindowStyle', 'Hidden', '-Command', size_check_cmd],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                        creationflags=CREATE_NO_WINDOW
+                    )
+                    final_bytes = int(size_result.stdout.strip()) if size_result.returncode == 0 and size_result.stdout.strip() else 0
+                    final_gb = final_bytes / (1024**3)
+                    final_mb = final_bytes / (1024 * 1024)
+                    speed_mbps = final_mb / elapsed_time if elapsed_time > 0 else 0
+
+                    logger.info(f"Windows copy completed in {elapsed_time:.1f} seconds")
+                    logger.info(f"Data copied: {final_gb:.2f} GB ({final_bytes:,} bytes) at {speed_mbps:.1f} MB/s")
+
+                    if "COMPLETED_WITH_ERRORS" in stdout:
+                        logger.warning("Copy completed but some files may have been skipped (check PowerShell errors)")
+                        if stderr:
+                            logger.warning(f"PowerShell errors: {stderr[:500]}")  # Log first 500 chars of errors
+
+                    # Final progress - but reserve a bit for Archive bit fix
+                    copy_progress = min(95, base_progress + progress_range * 0.95)
+                    self._report_progress(stage_name, copy_progress, f"✓ Copied {final_gb:.1f} GB - Fixing Archive bits...")
+
+                except Exception as e:
+                    logger.warning(f"Could not get final copy size: {e}")
+                    copy_progress = min(95, base_progress + progress_range * 0.95)
+                    self._report_progress(stage_name, copy_progress, "✓ Copy completed - Fixing Archive bits...")
+
+                # Fix Archive bit for Nintendo Switch compatibility using Hekate's logic
+                # Hekate's behavior (from hekate-ext/nyx/nyx_gui/frontend/gui_tools.c):
+                # - SET Archive bit on HOS single file folders (those containing a "/00" file)
+                # - CLEAR Archive bit on all other folders
+                logger.info("Fixing Archive bits for Nintendo Switch compatibility (Hekate logic)...")
+                logger.info("Scanning folders for HOS single file containers...")
+
+                try:
+                    fix_start = time.time()
+
+                    # PowerShell script implementing Hekate's Archive bit fix logic
+                    # This matches the behavior in hekate-ext/nyx/nyx_gui/frontend/gui_tools.c _fix_attributes()
+                    fix_script = f'''
+                    $ErrorActionPreference = "Continue"
+                    $targetPath = "{target}"
+
+                    # Counters (matching Hekate's total[] array)
+                    $bitsSet = 0      # Archive bits SET (HOS folders)
+                    $bitsUnset = 0    # Archive bits UNSET (regular folders)
+                    $errors = 0       # Errors encountered
+
+                    # Get all directories recursively
+                    $directories = Get-ChildItem -Path $targetPath -Directory -Recurse -Force -ErrorAction SilentlyContinue
+
+                    Write-Output "Found $($directories.Count) directories to process"
+
+                    foreach ($dir in $directories) {{
+                        try {{
+                            # Check if this is a HOS single file folder by looking for "/00" file
+                            $hosMarkerFile = Join-Path $dir.FullName "00"
+                            $isHosFolder = Test-Path -Path $hosMarkerFile -PathType Leaf
+
+                            # Get current attributes
+                            $currentAttrib = $dir.Attributes
+                            $hasArchiveBit = ($currentAttrib -band [System.IO.FileAttributes]::Archive) -ne 0
+
+                            if ($isHosFolder) {{
+                                # HOS single file folder - SET Archive bit if not already set
+                                if (-not $hasArchiveBit) {{
+                                    $dir.Attributes = $currentAttrib -bor [System.IO.FileAttributes]::Archive
+                                    $bitsSet++
+                                }}
+                            }} else {{
+                                # Regular folder - CLEAR Archive bit if set
+                                if ($hasArchiveBit) {{
+                                    $dir.Attributes = $currentAttrib -band (-bnot [System.IO.FileAttributes]::Archive)
+                                    $bitsUnset++
+                                }}
+                            }}
+                        }} catch {{
+                            $errors++
+                        }}
+                    }}
+
+                    Write-Output "ARCHIVE_FIX_COMPLETE"
+                    Write-Output "BitsSet:$bitsSet"
+                    Write-Output "BitsUnset:$bitsUnset"
+                    Write-Output "Errors:$errors"
+                    '''
+
+                    logger.info("Running Hekate-style Archive bit fix...")
+                    self._report_progress(stage_name, copy_progress + 2, "Fixing Archive bits (Hekate logic)...")
+
+                    fix_result = subprocess.run(
+                        ['powershell', '-NoProfile', '-WindowStyle', 'Hidden', '-Command', fix_script],
+                        capture_output=True,
+                        text=True,
+                        timeout=300,  # 5 minute timeout for Archive bit fix
+                        creationflags=CREATE_NO_WINDOW
+                    )
+
+                    fix_elapsed = time.time() - fix_start
+
+                    if "ARCHIVE_FIX_COMPLETE" in fix_result.stdout:
+                        # Parse the results
+                        output_lines = fix_result.stdout.strip().split('\n')
+                        bits_set = 0
+                        bits_unset = 0
+                        errors = 0
+
+                        for line in output_lines:
+                            if line.startswith("BitsSet:"):
+                                bits_set = int(line.split(':')[1])
+                            elif line.startswith("BitsUnset:"):
+                                bits_unset = int(line.split(':')[1])
+                            elif line.startswith("Errors:"):
+                                errors = int(line.split(':')[1])
+
+                        logger.info(f"Archive bit fix completed in {fix_elapsed:.1f}s")
+                        logger.info(f"Archive bits SET (HOS folders): {bits_set}")
+                        logger.info(f"Archive bits UNSET (regular folders): {bits_unset}")
+
+                        if errors > 0:
+                            logger.warning(f"Encountered {errors} errors during Archive bit fix")
+
+                        logger.info("Nintendo Switch should now recognize all files correctly!")
+                    else:
+                        logger.warning("Archive bit fix may have encountered issues")
+                        if fix_result.stderr:
+                            logger.warning(f"Fix errors: {fix_result.stderr[:200]}")
+
+                except Exception as e:
+                    logger.warning(f"Archive bit fix failed: {e}")
+                    logger.warning("You may need to use Hekate 'Fix Archive Bit' tool manually")
+
+                # Final progress
+                final_progress = min(100, base_progress + progress_range)
+                self._report_progress(stage_name, final_progress, f"✓ Copied {final_gb:.1f} GB + Archive fix in {elapsed_time:.0f}s")
+
+                logger.info("FAT32 file copy completed successfully using Windows native method")
+
+            else:
+                logger.error(f"PowerShell copy failed with return code: {process.returncode}")
+                if stderr:
+                    logger.error(f"PowerShell errors: {stderr}")
+                raise Exception(f"Windows copy operation failed. Check logs for details.")
+
+        except subprocess.TimeoutExpired:
+            process.kill()
+            raise Exception("Windows copy operation timed out")
+        except Exception as e:
+            logger.error(f"Windows copy error: {e}")
             raise
 
     def _copy_files_robocopy(self, source_drive, target_drive, stage_name, base_progress):
