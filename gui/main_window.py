@@ -1193,9 +1193,9 @@ For more help:
         # Get version from main module
         try:
             import __main__
-            version = getattr(__main__, '__version__', '1.0.0')
+            version = getattr(__main__, '__version__', '1.0.1')
         except:
-            version = '1.0.0'
+            version = '1.0.1'
 
         about_text = f"""NX MIGRATOR PRO
 

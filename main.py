@@ -9,7 +9,7 @@ License: GPL-2.0 (same as hekate)
 """
 
 # Version information
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
