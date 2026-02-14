@@ -47,7 +47,7 @@ jobs:
           }
 
       - name: Upload EXE artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: NXMigratorPro-exe
           path: dist/NXMigratorPro.exe
