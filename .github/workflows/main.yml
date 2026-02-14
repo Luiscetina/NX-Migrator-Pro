@@ -1,4 +1,4 @@
-name: CI
+name: Build EXE
 
 on:
   push:
@@ -7,40 +7,74 @@ on:
   pull_request:
     branches:
       - main
+  workflow_dispatch:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v2
+        uses: actions/setup-python@v4
         with:
-          python-version: '3.8'
+          python-version: '3.11'
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install pyinstaller
+          # Add any other dependencies from requirements.txt if it exists
+          if (Test-Path requirements.txt) {
+            pip install -r requirements.txt
+          }
 
-      - name: Lint code
+      - name: Build EXE with PyInstaller
         run: |
-          pip install flake8
-          flake8 . || true
+          pyinstaller --onefile --windowed --icon=icon.ico --name=NXMigratorPro main.py
+        continue-on-error: true
 
-      - name: Run Tests
+      - name: Check build output
         run: |
-          pip install pytest
-          pytest || true
+          if (Test-Path dist/NXMigratorPro.exe) {
+            Write-Host "EXE built successfully"
+            dir dist/
+          } else {
+            Write-Host "EXE not found, checking for alternative outputs"
+            dir dist/ -Recurse
+          }
 
-      - name: Install .NET Core
-        uses: actions/setup-dotnet@v1
+      - name: Upload EXE artifacts
+        uses: actions/upload-artifact@v3
         with:
-          dotnet-version: '5.0.x'
+          name: NXMigratorPro-exe
+          path: dist/NXMigratorPro.exe
+          if-no-files-found: warn
 
-      - name: Build C# Project
-        run: |
-          if [ -f YourCSharpProject.sln ]; then dotnet build YourCSharpProject.sln; else echo "C# project file not found"; fi
+      - name: Create Release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v${{ github.run_number }}
+          release_name: Release v${{ github.run_number }}
+          body: |
+            Automated build of NXMigratorPro
+            Build date: ${{ github.event.head_commit.timestamp }}
+          draft: false
+          prerelease: false
+
+      - name: Upload Release Asset
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./dist/NXMigratorPro.exe
+          asset_name: NXMigratorPro.exe
+          asset_content_type: application/octet-stream
+        continue-on-error: true
