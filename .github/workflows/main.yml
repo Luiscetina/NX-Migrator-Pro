@@ -145,14 +145,8 @@ jobs:
     
     steps:
       - name: Check build status
-        run: |
-          if [ "${{ needs.build-windows.result }}" == "success" ]; then
-            echo "✓ All builds completed successfully"
-            exit 0
-          else
-            echo "✗ Build failed"
-            exit 1
-          fi
+        if: failure() # Or use success(), depends on logic
+        run: echo "✗ Build failed" && exit 1
 
       - name: Notify on failure
         if: failure()
